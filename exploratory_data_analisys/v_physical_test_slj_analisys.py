@@ -1,4 +1,20 @@
 # Databricks notebook source
+import sys
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+import matplotlib.pyplot as plt
+from pyspark.ml.stat import Correlation
+import pandas as pd
+from pyspark.sql.window import Window
+import seaborn as sns
+from functools import reduce
+from pyspark.ml.evaluation import ClusteringEvaluator
+
+# COMMAND ----------
+
 # DBTITLE 1,Header SLJ
 # MAGIC %md
 # MAGIC # Tabla v_physical_test_slj
@@ -466,14 +482,14 @@ else:
 
 # DBTITLE 1,Nota decisiones correlación SLJ
 # MAGIC %md
-# MAGIC Decidir qué columnas eliminar según criterio de dominio tras analizar los pares altamente correlacionados.
+# MAGIC Eliminamos rsi_modified_stddev por ser una de las dos columnas con algún nulo.
 
 # COMMAND ----------
 
 # DBTITLE 1,Drop columnas correlacionadas SLJ
 # Eliminar columnas altamente correlacionadas (completar tras análisis)
 cols_to_drop_corr_pairs = [
-    # Añadir aquí las columnas a eliminar tras revisar high_corr_pd
+    "rsi_modified_stddev"
 ]
 
 if cols_to_drop_corr_pairs:
@@ -484,3 +500,208 @@ else:
     df_reduced = df_cleaned
     print("No se eliminaron columnas por correlación.")
     print(f"Columnas: {len(df_reduced.columns)}")
+
+# COMMAND ----------
+
+# Winsorización usando límites p05 - 3*IQR y p95 + 3*IQR
+
+# Filter numeric_cols to only columns still present in df_reduced
+numeric_cols_reduced = [c for c in numeric_cols if c in df_reduced.columns]
+
+winsor_limits = {
+    c: {
+        "lower": percentiles_dict[c]["p05"] - 3 * (percentiles_dict[c]["p75"] - percentiles_dict[c]["p25"]),
+        "upper": percentiles_dict[c]["p95"] + 3 * (percentiles_dict[c]["p75"] - percentiles_dict[c]["p25"])
+    }
+    for c in numeric_cols_reduced
+}
+
+df_winsor = df_reduced
+
+for c in numeric_cols_reduced:
+    lower = winsor_limits[c]["lower"]
+    upper = winsor_limits[c]["upper"]
+    df_winsor = df_winsor.withColumn(
+        c,
+        F.when(F.col(c) < lower, lower)
+         .when(F.col(c) > upper, upper)
+         .otherwise(F.col(c))
+    )
+
+display(df_winsor.limit(10))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Agregado por jugador
+
+# COMMAND ----------
+
+df=df_winsor
+
+# COMMAND ----------
+
+ID_COL = "id_unico_deportista"
+SEASON_COL = "season"
+
+df_base = df
+
+MIN_TESTS_25_26 = 5
+SEASON_RECENT = "25-26"
+SEASONS_RECENT_2 = ["24-25", "25-26"]
+
+jugadores_total = (
+    df_base
+    .select(ID_COL)
+    .distinct()
+)
+
+tests_25_26 = (
+    df_base
+    .filter(F.col(SEASON_COL) == SEASON_RECENT)
+    .groupBy(ID_COL)
+    .agg(F.count("*").alias("n_tests_25_26"))
+)
+
+tests_24_25_25_26 = (
+    df_base
+    .filter(F.col(SEASON_COL).isin(SEASONS_RECENT_2))
+    .groupBy(ID_COL)
+    .agg(F.count("*").alias("n_tests_24_25_25_26"))
+)
+
+criterio_jugador = (
+    jugadores_total
+    .join(tests_25_26, on=ID_COL, how="left")
+    .join(tests_24_25_25_26, on=ID_COL, how="left")
+    .fillna({
+        "n_tests_25_26": 0,
+        "n_tests_24_25_25_26": 0
+    })
+    .withColumn(
+        "temporada_fuente",
+        F.when(
+            F.col("n_tests_25_26") >= MIN_TESTS_25_26,
+            F.lit("solo_25_26")
+        )
+        .when(
+            F.col("n_tests_24_25_25_26") > 0,
+            F.lit("24_25_y_25_26")
+        )
+        .otherwise(F.lit("todas_disponibles"))
+    )
+)
+
+display(
+    criterio_jugador
+    .groupBy("temporada_fuente")
+    .agg(
+        F.count("*").alias("n_jugadores"),
+        F.avg("n_tests_25_26").alias("avg_tests_25_26"),
+        F.avg("n_tests_24_25_25_26").alias("avg_tests_24_25_25_26")
+    )
+)
+
+# COMMAND ----------
+
+df_con_criterio = (
+    df_base
+    .join(
+        criterio_jugador.select(ID_COL, "temporada_fuente"),
+        on=ID_COL,
+        how="inner"
+    )
+)
+
+df_tests_para_agregar = (
+    df_con_criterio
+    .filter(
+        (
+            (F.col("temporada_fuente") == "solo_25_26") &
+            (F.col(SEASON_COL) == "25-26")
+        )
+        |
+        (
+            (F.col("temporada_fuente") == "24_25_y_25_26") &
+            (F.col(SEASON_COL).isin(["24-25", "25-26"]))
+        )
+        |
+        (
+            F.col("temporada_fuente") == "todas_disponibles"
+        )
+    )
+)
+
+display(
+    df_tests_para_agregar
+    .groupBy("temporada_fuente")
+    .agg(
+        F.count("*").alias("n_tests"),
+        F.countDistinct(ID_COL).alias("n_jugadores")
+    )
+)
+
+# COMMAND ----------
+
+cols_excluir_agregacion = [
+    ID_COL,
+    "test_id",
+    "test_date",
+    "test_hour_utc",
+    "device",
+    SEASON_COL,
+    "temporada_fuente"
+]
+
+numeric_cols = [
+    field.name
+    for field in df_tests_para_agregar.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name not in cols_excluir_agregacion
+    and not field.name.endswith("_missing")
+]
+
+missing_flag_cols = [
+    field.name
+    for field in df_tests_para_agregar.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name.endswith("_missing")
+]
+
+agg_exprs = [
+    F.count("*").alias("n_tests_agregados"),
+    F.countDistinct(SEASON_COL).alias("n_temporadas_agregadas"),
+    F.first("temporada_fuente").alias("temporada_fuente"),
+    F.min("test_date").alias("first_test_date"),
+    F.max("test_date").alias("last_test_date")
+]
+
+# Media de variables numéricas
+for c in numeric_cols:
+    agg_exprs.append(
+        F.avg(c).alias(f"{c}_mean")
+    )
+
+# Flags de missing como porcentaje
+for c in missing_flag_cols:
+    agg_exprs.append(
+        F.avg(c).alias(f"pct_{c}")
+    )
+
+df_player_agg = (
+    df_tests_para_agregar
+    .groupBy(ID_COL)
+    .agg(*agg_exprs)
+)
+
+display(df_player_agg)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC La estrategia de agregación prioriza siempre la información más reciente del jugador, pero evitando construir perfiles poco fiables con muy pocos tests. Para cada deportista, si dispone de al menos 5 mediciones en la temporada 25-26, se agregan únicamente esos registros, ya que representan mejor su estado actual. Si no alcanza ese mínimo, se amplía la ventana temporal incluyendo también la temporada 24-25, aumentando así la estabilidad del perfil. Finalmente, para los jugadores sin mediciones en las dos últimas temporadas, se utilizan todos los registros históricos disponibles para no perderlos del análisis. Una vez seleccionados los tests válidos para cada jugador, las variables numéricas se agregan mediante la media, generando una única fila por deportista que resume su perfil físico para el clustering.
+
+# COMMAND ----------
+
+df_player_agg.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.slj_agregado_por_jugador")

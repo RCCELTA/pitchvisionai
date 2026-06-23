@@ -1,4 +1,20 @@
 # Databricks notebook source
+import sys
+import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+import matplotlib.pyplot as plt
+from pyspark.ml.stat import Correlation
+import pandas as pd
+from pyspark.sql.window import Window
+import seaborn as sns
+from functools import reduce
+
+# COMMAND ----------
+
 # DBTITLE 1,Header CMJ
 # MAGIC %md
 # MAGIC # Tabla v_physical_test_cmj
@@ -355,29 +371,151 @@ else:
 
 # COMMAND ----------
 
-# DBTITLE 1,Rango fechas CMJ
-print("\n11. RANGO DE COLUMNA FECHA: test_date")
+# Winsorización con límites a 3*IQR de los percentiles 05 y 95
 
-display(
-    df.agg(
-        F.min("test_date").alias("fecha_minima"),
-        F.max("test_date").alias("fecha_maxima")
-    )
-)
+winsorized_df = df
+
+for c in numeric_cols:
+    try:
+        p05 = percentiles_dict[c]["p05"]
+        p25 = percentiles_dict[c]["p25"]
+        p75 = percentiles_dict[c]["p75"]
+        p95 = percentiles_dict[c]["p95"]
+        iqr = p75 - p25
+
+        lower_limit = p05 - 3 * iqr
+        upper_limit = p95 + 3 * iqr
+
+        winsorized_df = winsorized_df.withColumn(
+            c,
+            F.when(F.col(c) < lower_limit, lower_limit)
+             .when(F.col(c) > upper_limit, upper_limit)
+             .otherwise(F.col(c))
+        )
+    except Exception as e:
+        print(f"No se pudo winsorizar columna {c}: {e}")
+
+print("Winsorización aplicada con límites a 3*IQR de p05 y p95.")
+display(winsorized_df.limit(10))
 
 # COMMAND ----------
 
-# DBTITLE 1,Duplicados CMJ
-#  Duplicados
-print("\n12. DUPLICADOS EXACTOS")
-print("-" * 100)
+df= winsorized_df
 
-distinct_rows = df.distinct().count()
-duplicated_rows = num_rows - distinct_rows
+# COMMAND ----------
 
-print(f"Filas totales: {num_rows:,}")
-print(f"Filas distintas: {distinct_rows:,}")
-print(f"Filas duplicadas exactas: {duplicated_rows:,}")
+# Imputar nulos numéricos con la mediana del propio jugador en otras fechas
+
+from pyspark.sql import Window
+
+ID_COL = "id_unico_deportista"
+DATE_COL = "test_date"
+
+# Crear ventanas por jugador
+w_player = Window.partitionBy(ID_COL)
+
+# Calcular la mediana por jugador para cada columna numérica
+player_medians = df.select(
+    ID_COL,
+    *[
+        F.expr(f"percentile_approx({c}, 0.5)").over(w_player).alias(f"{c}__player_median")
+        for c in numeric_cols
+    ]
+)
+
+# Unir las medianas al dataframe original
+df_with_medians = df.join(player_medians, on=ID_COL, how="left")
+
+# Imputar nulos con la mediana del jugador
+imputed_exprs = [
+    F.when(
+        F.col(c).isNull(), F.col(f"{c}__player_median")
+    ).otherwise(F.col(c)).alias(c)
+    if c in numeric_cols else F.col(c)
+    for c in df.columns
+]
+
+df_imputed = df_with_medians.select(*imputed_exprs)
+
+# Contar nulos restantes por columna
+null_exprs = [
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df_imputed.columns
+]
+
+nulls_after_impute = df_imputed.agg(*null_exprs)
+
+nulls_long = nulls_after_impute.select(
+    F.explode(
+        F.array(*[
+            F.struct(
+                F.lit(c).alias("columna"),
+                F.col(c).alias("nulos")
+            )
+            for c in df_imputed.columns
+        ])
+    ).alias("x")
+).select("x.*")
+
+nulls_report_after = (
+    nulls_long
+    .withColumn("filas_totales", F.lit(df_imputed.count()))
+    .withColumn(
+        "porcentaje_nulos",
+        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
+    )
+    .orderBy(F.col("porcentaje_nulos").desc())
+)
+
+display(nulls_report_after)
+
+# COMMAND ----------
+
+# Imputar los nulos restantes con la mediana global de cada columna numérica
+
+remaining_nulls = [
+    row["columna"]
+    for row in nulls_report_after.filter(F.col("nulos") > 0).collect()
+]
+
+global_medians = {}
+for c in remaining_nulls:
+    try:
+        median = df_imputed.approxQuantile(c, [0.5], 0.01)[0]
+        global_medians[c] = median
+    except Exception:
+        global_medians[c] = None
+
+df_final = df_imputed.fillna(global_medians)
+
+# Verificar nulos restantes
+null_exprs = [
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df_final.columns
+]
+nulls_final = df_final.agg(*null_exprs)
+nulls_long_final = nulls_final.select(
+    F.explode(
+        F.array(*[
+            F.struct(
+                F.lit(c).alias("columna"),
+                F.col(c).alias("nulos")
+            )
+            for c in df_final.columns
+        ])
+    ).alias("x")
+).select("x.*")
+nulls_report_final = (
+    nulls_long_final
+    .withColumn("filas_totales", F.lit(df_final.count()))
+    .withColumn(
+        "porcentaje_nulos",
+        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
+    )
+    .orderBy(F.col("porcentaje_nulos").desc())
+)
+
+display(nulls_report_final)
 
 # COMMAND ----------
 
@@ -387,26 +525,7 @@ print(f"Filas duplicadas exactas: {duplicated_rows:,}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Nota imputación CMJ
-# MAGIC %md
-# MAGIC Rellenamos los nulos con la mediana aproximada para poder calcular la matriz de correlación.
-
-# COMMAND ----------
-
-# DBTITLE 1,Imputación mediana CMJ
-# Rellenamos nulos numéricos con la mediana aproximada
-df_cleaned = df
-
-median_values = {}
-
-for c in numeric_cols:
-    try:
-        median = df_cleaned.approxQuantile(c, [0.5], 0.01)[0]
-        median_values[c] = median
-    except Exception:
-        median_values[c] = 0
-
-df_cleaned = df_cleaned.fillna(median_values)
+df_cleaned=df_final
 
 # COMMAND ----------
 
@@ -466,23 +585,172 @@ else:
 
 # COMMAND ----------
 
-# DBTITLE 1,Nota decisiones correlación CMJ
 # MAGIC %md
-# MAGIC Decidir cual eliminar, aqui dificil seguir criterio
+# MAGIC Eliminamos columnas best frente a avg
 
 # COMMAND ----------
 
-# DBTITLE 1,Drop columnas correlacionadas CMJ
-# Eliminar columnas altamente correlacionadas (completar tras análisis)
+# VARIABLES ELIMINADAS POR ALTA CORRELACIÓN
+
 cols_to_drop_corr_pairs = [
-    # Añadir aquí las columnas a eliminar tras revisar high_corr_pd
+    "concentric_impulse_ns_best",
+    "peak_power_bm_w_kg_best",
+    "concentric_mean_power_bm_w_kg_best",
+    "rsi_modified_imp_mom_best",
+    "jump_height_imp_mom_cm_best",
+    "concentric_peak_force_bm_n_kg_best"
 ]
 
-if cols_to_drop_corr_pairs:
-    df_reduced = df_cleaned.drop(*cols_to_drop_corr_pairs)
-    print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
-    print(f"Columnas restantes: {len(df_reduced.columns)}")
-else:
-    df_reduced = df_cleaned
-    print("No se eliminaron columnas por correlaci\u00f3n.")
-    print(f"Columnas: {len(df_reduced.columns)}")
+df_reduced = df_cleaned.drop(*cols_to_drop_corr_pairs)
+
+print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
+print(f"Columnas restantes: {len(df_reduced.columns)}")
+
+# COMMAND ----------
+
+ultimas_temporadas = ["24-25", "25-26"]
+
+total_jugadores = df_cleaned.select("id_unico_deportista").distinct().count()
+jugadores_ultimas = (
+    df_cleaned
+    .filter(F.col("season").isin(ultimas_temporadas))
+    .select("id_unico_deportista")
+    .distinct()
+    .count()
+)
+porcentaje_ultimas = round((jugadores_ultimas / total_jugadores) * 100, 2)
+print(f"Porcentaje de jugadores con al menos una medición en las temporadas {ultimas_temporadas}: {porcentaje_ultimas}%")
+
+# COMMAND ----------
+
+# Conteo de jugadores por temporada y número de sesiones
+from pyspark.sql import functions as F
+
+sesiones_por_jugador = (
+    df_cleaned.groupBy("id_unico_deportista", "season")
+    .count()
+    .withColumnRenamed("count", "num_sesiones")
+)
+
+# Filtrar solo la temporada 25-26
+sesiones_ultima_temp = sesiones_por_jugador.filter(F.col("season") == "25-26")
+
+resumen = (
+    sesiones_ultima_temp.groupBy("season", "num_sesiones")
+    .agg(F.count("id_unico_deportista").alias("num_jugadores"))
+    .orderBy("season", "num_sesiones")
+)
+
+display(resumen)
+
+# COMMAND ----------
+
+df_cleaned = df_reduced
+
+# COMMAND ----------
+
+# Recalcular numeric_cols desde df_cleaned actual (sin columnas eliminadas por correlación)
+numeric_cols = [
+    field.name for field in df_cleaned.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name not in ["id_unico_deportista", "n_trials", "is_restricted"]
+]
+
+# Crear DataFrame base con sesiones por jugador y temporada
+sesiones_por_jugador = (
+    df_cleaned.groupBy("id_unico_deportista", "season")
+    .count()
+    .withColumnRenamed("count", "num_sesiones")
+)
+
+# 1. Jugadores con >=5 sesiones en 25-26: media de 25-26
+jugadores_25_26 = (
+    sesiones_por_jugador
+    .filter((F.col("season") == "25-26") & (F.col("num_sesiones") >= 5))
+    .select("id_unico_deportista")
+    .distinct()
+)
+
+df_25_26 = (
+    df_cleaned
+    .filter(F.col("season") == "25-26")
+    .join(jugadores_25_26, on="id_unico_deportista", how="inner")
+    .groupBy("id_unico_deportista")
+    .agg(*[F.mean(c).alias(c) for c in numeric_cols])
+    .withColumn("temporada_fuente", F.lit("25-26"))
+)
+
+# 2. Jugadores con <5 sesiones en 25-26 pero >=5 en 24-25+25-26: media de ambas
+jugadores_restantes = (
+    df_cleaned.select("id_unico_deportista").distinct()
+    .join(jugadores_25_26, on="id_unico_deportista", how="left_anti")
+)
+
+sesiones_ultimas = (
+    sesiones_por_jugador
+    .filter(F.col("season").isin(["24-25", "25-26"]))
+    .groupBy("id_unico_deportista")
+    .agg(F.sum("num_sesiones").alias("total_sesiones_ultimas"))
+    .filter(F.col("total_sesiones_ultimas") >= 5)
+)
+
+jugadores_ultimas = (
+    jugadores_restantes
+    .join(sesiones_ultimas, on="id_unico_deportista", how="inner")
+    .select("id_unico_deportista")
+)
+
+df_ultimas = (
+    df_cleaned
+    .filter(F.col("season").isin(["24-25", "25-26"]))
+    .join(jugadores_ultimas, on="id_unico_deportista", how="inner")
+    .groupBy("id_unico_deportista")
+    .agg(*[F.mean(c).alias(c) for c in numeric_cols])
+    .withColumn("temporada_fuente", F.lit("24-25+25-26"))
+)
+
+# 3. Jugadores restantes: media de todas sus mediciones (aunque no sean 5)
+jugadores_sin_suficientes = (
+    df_cleaned.select("id_unico_deportista").distinct()
+    .join(jugadores_25_26, on="id_unico_deportista", how="left_anti")
+    .join(jugadores_ultimas, on="id_unico_deportista", how="left_anti")
+)
+
+df_antiguas = (
+    df_cleaned
+    .join(jugadores_sin_suficientes, on="id_unico_deportista", how="inner")
+    .groupBy("id_unico_deportista")
+    .agg(*[F.mean(c).alias(c) for c in numeric_cols])
+    .withColumn("temporada_fuente", F.lit("antiguas"))
+)
+
+# Unir todos los casos
+df_final_para_Clustering = (
+    df_25_26
+    .unionByName(df_ultimas)
+    .unionByName(df_antiguas)
+)
+
+display(df_final_para_Clustering)
+
+# COMMAND ----------
+
+# Comprobar nulos en df_final_para_Clustering
+from pyspark.sql.functions import col, sum as sum_
+
+null_counts = (
+    df_final_para_Clustering
+    .select([
+        sum_(col(c).isNull().cast("int")).alias(c)
+        for c in df_final_para_Clustering.columns
+    ])
+)
+
+display(null_counts)
+
+# COMMAND ----------
+
+df_final_para_Clustering.write.mode("overwrite").saveAsTable(
+    "dev_gold.pitchvision.cmj_agregado_por_jugador"
+)
+

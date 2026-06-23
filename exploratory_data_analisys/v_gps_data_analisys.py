@@ -1,6 +1,18 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # Tabla v_gps_data
+import sys
+import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+import matplotlib.pyplot as plt
+from pyspark.ml.stat import Correlation
+import pandas as pd
+from pyspark.sql.window import Window
+import seaborn as sns
+from functools import reduce
+import numpy as np
 
 # COMMAND ----------
 
@@ -141,46 +153,8 @@ for c in cols_missing:
 
 # COMMAND ----------
 
-for c in cols_missing:
-    print(f"\nNulos de {c} por activity_team_id")
-
-    display(
-        df
-        .groupBy("activity_team_id")
-        .agg(
-            F.count("*").alias("filas"),
-            F.sum(F.col(c).isNull().cast("int")).alias("nulos"),
-            F.round(F.sum(F.col(c).isNull().cast("int")) / F.count("*") * 100, 2).alias("pct_nulos")
-        )
-        .orderBy(F.col("pct_nulos").desc())
-    )
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC Agrupando por equipo de actividad en lugar de temporada no obtenemos ninguna conclusión.
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC Añadimos columnas con flag de disponibilidad o no de la variable
-
-# COMMAND ----------
-
-df = (
-    df
-    .withColumn(
-        "has_high_intensity_data",
-        (
-            F.col("sprint_high_intensity_count").isNotNull()
-            & F.col("sprint_high_intensity_distance").isNotNull()
-        ).cast("int")
-    )
-    .withColumn(
-        "has_player_load_data",
-        F.col("player_load").isNotNull().cast("int")
-    )
-)
 
 # COMMAND ----------
 
@@ -481,6 +455,11 @@ else:
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC No hay ningún caso extremo y desde cliente aseguran que los métodos de medición están estandarizados y es poco probable que haya errores. Por lo tanto no se procede con ninguna estrategia de valores atípicos. Para no eliminar posibles jugadores extraordinarios o que destaquen mucho en alguna sesión.
+
+# COMMAND ----------
+
 for c in top_extreme_cols:
     plot_df = (
         df
@@ -527,6 +506,19 @@ duplicated_rows = num_rows - distinct_rows
 print(f"Filas totales: {num_rows:,}")
 print(f"Filas distintas: {distinct_rows:,}")
 print(f"Filas duplicadas exactas: {duplicated_rows:,}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Eliminamos duplicados
+
+# COMMAND ----------
+
+df = df.distinct()
+
+# COMMAND ----------
+
+df.count()
 
 # COMMAND ----------
 
@@ -579,11 +571,11 @@ for i, c1 in enumerate(cols_corr):
         
         if c1 == c2:
             corr_pd.loc[c1, c2] = 1.0
-            n_valid_pd.loc[c1, c2] = df_cleaned.filter(F.col(c1).isNotNull()).count()
+            n_valid_pd.loc[c1, c2] = df.filter(F.col(c1).isNotNull()).count()
             continue
         
         df_pair = (
-            df_cleaned
+            df
             .select(c1, c2)
             .filter(
                 F.col(c1).isNotNull() &
@@ -686,3 +678,354 @@ cols_to_drop_corr = [
 ]
 
 df_reduced = df.drop(*cols_to_drop_corr)
+
+# COMMAND ----------
+
+df=df_reduced
+
+# COMMAND ----------
+
+#  Nulos por columna
+
+print("\n6. NULOS POR COLUMNA")
+null_exprs = [
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df.columns
+]
+
+nulls_df = df.agg(*null_exprs)
+
+nulls_long = nulls_df.select(
+    F.explode(
+        F.array(*[
+            F.struct(
+                F.lit(c).alias("columna"),
+                F.col(c).alias("nulos")
+            )
+            for c in df.columns
+        ])
+    ).alias("x")
+).select("x.*")
+
+nulls_report = (
+    nulls_long
+    .withColumn("filas_totales", F.lit(num_rows))
+    .withColumn(
+        "porcentaje_nulos",
+        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
+    )
+    .orderBy(F.col("porcentaje_nulos").desc())
+)
+
+display(nulls_report)
+
+# COMMAND ----------
+
+df = df.withColumn(
+    "sprint_high_intensity_distance_isnull",
+    F.col("sprint_high_intensity_distance").isNull().cast("int")
+)
+
+# COMMAND ----------
+
+display(df.limit(1))
+
+# COMMAND ----------
+
+# Variable objetivo a imputar
+target = "sprint_high_intensity_distance"
+
+# Variables completas/correlacionadas que quieres usar para definir registros similares
+vars_similares = [
+    "sprint_count",
+    "sprint_distance"  # cambia o elimina esta si es la misma que target
+]
+
+# Seguridad: no usar el target como variable auxiliar
+vars_similares = [v for v in vars_similares if v != target]
+
+# Guardar copia original si no existe
+if f"{target}_original" not in df.columns:
+    df = df.withColumn(f"{target}_original", F.col(target))
+
+# Indicador de nulo original si no existe
+missing_col = f"{target}_missing"
+if missing_col not in df.columns:
+    df = df.withColumn(missing_col, F.col(target).isNull().cast("int"))
+
+print("Nulos antes:", df.filter(F.col(target).isNull()).count())
+
+# Crear bins por deciles para variables similares usando ntile
+q = 10
+bin_cols = []
+
+for col_name in vars_similares:
+    bin_col = f"{col_name}_bin"
+    # ntile over non-null values, null stays null
+    w = Window.orderBy(F.col(col_name))
+    df = df.withColumn(
+        bin_col,
+        F.when(F.col(col_name).isNotNull(), F.ntile(q).over(w))
+    )
+    bin_cols.append(bin_col)
+
+# Tamaño mínimo de grupo para fiarse de la mediana
+min_group_size = 20
+
+# Mediana y tamaño por grupo (solo filas con target no nulo)
+group_stats = (
+    df
+    .filter(F.col(target).isNotNull())
+    .groupBy(bin_cols)
+    .agg(
+        F.expr(f"percentile_approx({target}, 0.5)").alias("group_median"),
+        F.count("*").alias("group_count")
+    )
+)
+
+# Unir estadísticas al df
+df = df.join(F.broadcast(group_stats), on=bin_cols, how="left")
+
+# Imputar solo cuando el grupo tiene suficientes datos medidos
+df = df.withColumn(
+    target,
+    F.when(
+        F.col(target).isNull() &
+        F.col("group_median").isNotNull() &
+        (F.col("group_count") >= min_group_size),
+        F.col("group_median")
+    ).otherwise(F.col(target))
+)
+
+imputados_grupo = df.filter(
+    (F.col(missing_col) == 1) & F.col(target).isNotNull()
+).count()
+print("Imputados por grupo:", imputados_grupo)
+print("Nulos tras imputación por grupo:", df.filter(F.col(target).isNull()).count())
+
+# Fallback: mediana global
+global_median = df.filter(F.col(target).isNotNull()).approxQuantile(target, [0.5], 0.01)[0]
+df = df.withColumn(
+    target,
+    F.when(F.col(target).isNull(), F.lit(global_median)).otherwise(F.col(target))
+)
+
+print("Nulos finales:", df.filter(F.col(target).isNull()).count())
+
+# Limpiar columnas auxiliares de merge
+df = df.drop("group_median", "group_count")
+
+# Opcional: eliminar bins auxiliares si no los quieres conservar
+df = df.drop(*bin_cols)
+
+# COMMAND ----------
+
+display(df.limit(1))
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+# Filtrar temporada 25-26
+df_2526 = df.filter(F.col("season") == "25-26")
+
+# Resumen general
+resumen_2526 = df_2526.agg(
+    F.countDistinct("id_unico_deportista").alias("n_jugadores"),
+    F.count("*").alias("n_registros")
+)
+
+resumen_2526.show()
+
+# COMMAND ----------
+
+sesiones_por_jugador_2526 = (
+    df_2526
+    .groupBy("id_unico_deportista")
+    .agg(
+        F.count("*").alias("n_sesiones"),
+        F.min("activity_date").alias("primera_sesion"),
+        F.max("activity_date").alias("ultima_sesion")
+    )
+    .orderBy(F.desc("n_sesiones"))
+)
+
+sesiones_por_jugador_2526.show(50, truncate=False)
+
+# COMMAND ----------
+
+sesiones_por_jugador_2526.select("n_sesiones").summary().show()
+
+# COMMAND ----------
+
+umbrales = [0,5, 10, 15, 20, 30, 40]
+
+for u in umbrales:
+    n = (
+        sesiones_por_jugador_2526
+        .filter(F.col("n_sesiones") >= u)
+        .count()
+    )
+    print(f"Jugadores con >= {u} sesiones: {n}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Nos quedamos con los registros de la temporada 25-26, para aquellos jugadores que no lleguen al mínimo de 20 registros en esta temporada se seleccionan también los registros de la temporada pasada(24-25).
+
+# COMMAND ----------
+
+min_sesiones = 20
+
+# 1. Sesiones por jugador en 25-26
+sesiones_2526_por_jugador = (
+    df
+    .filter(F.col("season") == "25-26")
+    .groupBy("id_unico_deportista")
+    .agg(F.count("*").alias("n_sesiones_25_26"))
+)
+
+# 2. Jugadores con menos de 20 sesiones en 25-26
+jugadores_menos_20_2526 = (
+    sesiones_2526_por_jugador
+    .filter(F.col("n_sesiones_25_26") < min_sesiones)
+    .select("id_unico_deportista")
+)
+
+# 3. Todas las sesiones de 25-26
+df_2526 = (
+    df
+    .filter(F.col("season") == "25-26")
+)
+
+# 4. Sesiones de 24-25 solo para los jugadores con menos de 20 sesiones en 25-26
+df_2425_extra = (
+    df
+    .filter(F.col("season") == "24-25")
+    .join(jugadores_menos_20_2526, on="id_unico_deportista", how="inner")
+)
+
+# 5. Dataset final para clustering
+df_cluster_base = df_2526.unionByName(df_2425_extra)
+
+# 6. Comprobación
+resumen_cluster_base = (
+    df_cluster_base
+    .groupBy("id_unico_deportista")
+    .agg(
+        F.count("*").alias("n_sesiones_total"),
+        F.sum(F.when(F.col("season") == "25-26", 1).otherwise(0)).alias("n_sesiones_25_26"),
+        F.sum(F.when(F.col("season") == "24-25", 1).otherwise(0)).alias("n_sesiones_24_25"),
+        F.countDistinct("season").alias("n_temporadas")
+    )
+    .orderBy(F.asc("n_sesiones_total"))
+)
+
+resumen_cluster_base.show(100, truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Sigue habiendo jugadores que no llegan al mínimo de sesiones, suponemos que se deebrán a jugadores que se incorporaron al club recientemente.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+
+# COMMAND ----------
+
+# Umbral mínimo de minutos para considerar una sesión válida
+min_minutos = 45
+
+df_cluster_base_filtrado = (
+    df_cluster_base
+    .filter(F.col("participation_time_minutes") >= min_minutos)
+)
+
+# Comprobación general
+print("Registros antes:", df_cluster_base.count())
+print("Registros después:", df_cluster_base_filtrado.count())
+
+print(
+    "Jugadores antes:",
+    df_cluster_base.select("id_unico_deportista").distinct().count()
+)
+
+print(
+    "Jugadores después:",
+    df_cluster_base_filtrado.select("id_unico_deportista").distinct().count()
+)
+
+# COMMAND ----------
+
+sesiones_validas_por_jugador = (
+    df_cluster_base_filtrado
+    .groupBy("id_unico_deportista")
+    .agg(
+        F.count("*").alias("n_sesiones_validas"),
+        F.avg("participation_time_minutes").alias("avg_minutes"),
+        F.min("participation_time_minutes").alias("min_minutes"),
+        F.max("participation_time_minutes").alias("max_minutes"),
+        F.countDistinct("season").alias("n_temporadas")
+    )
+    .orderBy(F.asc("n_sesiones_validas"))
+)
+
+sesiones_validas_por_jugador.show(100, truncate=False)
+
+# COMMAND ----------
+
+vars_gps = [
+    "total_distance",
+    "max_velocity",
+    "max_acceleration",
+    "max_deceleration",
+    "acc_dcc_distance",
+    "acc_dcc_count",
+    "HSR",
+    "sprint_distance",
+    "sprint_count",
+    "sprint_high_intensity_distance",
+    "TSS",
+    "ratio_ac"
+]
+
+agg_exprs = [
+    F.count("*").alias("n_sesiones_validas"),
+    F.avg("participation_time_minutes").alias("avg_participation_minutes"),
+    F.countDistinct("season").alias("n_temporadas")
+]
+
+for col_name in vars_gps:
+    agg_exprs.extend([
+        F.avg(col_name).alias(f"{col_name}_mean"),
+        F.expr(f"percentile_approx({col_name}, 0.90)").alias(f"{col_name}_p90")
+    ])
+
+df_player_profile = (
+    df_cluster_base_filtrado
+    .groupBy("id_unico_deportista")
+    .agg(*agg_exprs)
+)
+
+df_player_profile.show(20, truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Antes de construir el clustering, hemos preparado la tabla GPS para que cada jugador tenga un perfil físico comparable y no dependa de sesiones aisladas o poco representativas. Primero seleccionamos como base todas las sesiones de la temporada 25-26 y, para los jugadores que no alcanzaban un mínimo de 20 sesiones en esa temporada, añadimos también sus sesiones de 24-25 para aumentar la fiabilidad del perfil. Después decidimos no usar la última sesión ni una sesión individual, sino agregar la información por jugador, ya que cada fila original representa un entrenamiento o partido y puede estar muy condicionada por el contexto. También descartamos sesiones con menos de 45 minutos de participación, porque los registros muy cortos pueden distorsionar las variables físicas acumuladas: no es comparable un jugador que participa 10 minutos con uno que juega una sesión completa. Además, tratamos previamente los nulos de sprint_high_intensity_distance: se conservó un indicador de si el dato era originalmente nulo y se imputó usando registros similares basados en variables correlacionadas. Finalmente, planteamos agrupar por jugador calculando la media de sus sesiones válidas para representar su perfil habitual y el percentil 90 para capturar sus valores altos o actuaciones de mayor rendimiento.
+
+# COMMAND ----------
+
+display(df_player_profile.head(10))
+
+# COMMAND ----------
+
+df_player_profile.write.mode("overwrite").saveAsTable(
+    "dev_gold.pitchvision.gps_data_agregado_por_jugador"
+)
+
+# COMMAND ----------
+
+

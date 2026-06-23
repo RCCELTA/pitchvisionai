@@ -1,7 +1,23 @@
 # Databricks notebook source
+import sys
+import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+import matplotlib.pyplot as plt
+from pyspark.ml.stat import Correlation
+import pandas as pd
+from pyspark.sql.window import Window
+import seaborn as sns
+from functools import reduce
+
+# COMMAND ----------
+
 # DBTITLE 1,Header Isoprone
 # MAGIC %md
-# MAGIC # Tabla v_physical_test_isoprone
+# MAGIC ## # Tabla v_physical_test_isoprone
 
 # COMMAND ----------
 
@@ -91,6 +107,157 @@ nulls_report = (
 )
 
 display(nulls_report)
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+cols_con_nulos = [
+    "left_max_force_normalized_length_bw",
+    "right_max_force_normalized_length_bw",
+    "left_max_force_normalized_bw",
+    "right_max_force_normalized_bw",
+    "torque_asym_pct",
+    "max_force_asym_pct",
+    "avg_force_asym_pct",
+    "impulse_asym_pct"
+]
+
+id_col = "id_unico_deportista"
+
+resumen_variables = None
+
+for col_name in cols_con_nulos:
+    
+    resumen_jugador = (
+        df
+        .groupBy(id_col)
+        .agg(
+            F.count("*").alias("n_tests"),
+            F.sum(F.col(col_name).isNotNull().cast("int")).alias("n_medidas"),
+            F.sum(F.col(col_name).isNull().cast("int")).alias("n_nulos")
+        )
+        .withColumn(
+            "estado",
+            F.when(F.col("n_medidas") == 0, "todas_nulas")
+             .when(F.col("n_nulos") == 0, "todas_medidas")
+             .otherwise("mixto")
+        )
+    )
+    
+    resumen_estado = (
+        resumen_jugador
+        .groupBy("estado")
+        .agg(
+            F.count("*").alias("n_jugadores"),
+            F.round(F.avg("n_tests"), 2).alias("avg_tests"),
+            F.round(F.avg("n_medidas"), 2).alias("avg_medidas"),
+            F.min("n_medidas").alias("min_medidas"),
+            F.max("n_medidas").alias("max_medidas")
+        )
+        .withColumn("variable", F.lit(col_name))
+        .select(
+            "variable",
+            "estado",
+            "n_jugadores",
+            "avg_tests",
+            "avg_medidas",
+            "min_medidas",
+            "max_medidas"
+        )
+    )
+    
+    resumen_variables = (
+        resumen_estado
+        if resumen_variables is None
+        else resumen_variables.unionByName(resumen_estado)
+    )
+
+display(resumen_variables.orderBy("variable", "estado"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Vemos que para las variables left_max_force_normalized_bw y right_max_force_normalized_bw hay 150 jugadores sin ninguna medida de un total de 332 jugadores y para right y left max_force_normalized_length_bw 283 de 332 por lo que procedemos a eliminar estas dos columnas. El resto de variables con nulos no merece la pena eliminarlas ya que se podrán imputar practicamente todas con registros del propio jugador.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Imputamos los valores faltantes usando la mediana del propio jugador; cuando un jugador no tenía ningún valor medido para una variable, usamos como respaldo la mediana global. Así mantenemos la información útil sin introducir un sesgo excesivo.
+
+# COMMAND ----------
+
+# 1. Columnas BW a eliminar
+cols_bw_drop = [
+    "left_max_force_normalized_bw",
+    "right_max_force_normalized_bw",
+    "left_max_force_normalized_length_bw",
+    "right_max_force_normalized_length_bw"
+]
+
+df = df.drop(*cols_bw_drop)
+
+# 2. Variables con pocos nulos que queremos imputar
+cols_imputar = [
+    "torque_asym_pct",
+    "max_force_asym_pct",
+    "avg_force_asym_pct",
+    "impulse_asym_pct"
+]
+
+id_col = "id_unico_deportista"
+
+# 3. Crear flags de nulo original
+for c in cols_imputar:
+    df = df.withColumn(
+        f"{c}_missing",
+        F.col(c).isNull().cast("int")
+    )
+
+# 4. Imputar con mediana del propio jugador
+for c in cols_imputar:
+    
+    # Mediana global como fallback
+    mediana_global = df.approxQuantile(c, [0.5], 0.01)[0]
+    
+    # Mediana por jugador
+    mediana_jugador = (
+        df
+        .groupBy(id_col)
+        .agg(
+            F.expr(f"percentile_approx({c}, 0.5)").alias(f"{c}_median_player")
+        )
+    )
+    
+    df = df.join(
+        mediana_jugador,
+        on=id_col,
+        how="left"
+    )
+    
+    # Primero mediana del jugador; si no existe, mediana global
+    df = df.withColumn(
+        c,
+        F.when(
+            F.col(c).isNull() & F.col(f"{c}_median_player").isNotNull(),
+            F.col(f"{c}_median_player")
+        )
+        .when(
+            F.col(c).isNull(),
+            F.lit(mediana_global)
+        )
+        .otherwise(F.col(c))
+    )
+    
+    df = df.drop(f"{c}_median_player")
+
+# 5. Comprobación de nulos restantes
+display(
+    df.select([
+        F.sum(F.col(c).isNull().cast("int")).alias(c)
+        for c in cols_imputar
+    ])
+)
 
 # COMMAND ----------
 
@@ -349,29 +516,79 @@ else:
 
 # COMMAND ----------
 
-# DBTITLE 1,Rango fechas Isoprone
-print("\n11. RANGO DE COLUMNA FECHA: test_date")
+# WINSORIZACIÓN CONSERVADORA
 
-display(
-    df.agg(
-        F.min("test_date").alias("fecha_minima"),
-        F.max("test_date").alias("fecha_maxima")
+ID_COL = "id_unico_deportista"
+
+IQR_FACTOR = 3.0
+
+exclude_cols = [
+    ID_COL,
+    "test_date",
+    "season",
+    "is_restricted"
+]
+
+numeric_cols_to_winsorize = [
+    field.name
+    for field in df.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name not in exclude_cols
+]
+
+bound_exprs = []
+
+for c in numeric_cols_to_winsorize:
+    bound_exprs.append(
+        F.expr(f"percentile_approx(`{c}`, 0.25)").alias(f"{c}__q1")
     )
-)
+    bound_exprs.append(
+        F.expr(f"percentile_approx(`{c}`, 0.75)").alias(f"{c}__q3")
+    )
+
+bounds_df = df.agg(*bound_exprs)
+
+df_winsor = df.crossJoin(bounds_df)
+
+select_exprs = []
+
+for col_name in df.columns:
+
+    if col_name in numeric_cols_to_winsorize:
+
+        q1_col = f"{col_name}__q1"
+        q3_col = f"{col_name}__q3"
+
+        iqr_expr = F.col(q3_col) - F.col(q1_col)
+
+        lower_expr = F.col(q1_col) - F.lit(IQR_FACTOR) * iqr_expr
+        upper_expr = F.col(q3_col) + F.lit(IQR_FACTOR) * iqr_expr
+
+        winsorized = (
+            F.when(
+                F.col(col_name) < lower_expr,
+                lower_expr
+            )
+            .when(
+                F.col(col_name) > upper_expr,
+                upper_expr
+            )
+            .otherwise(F.col(col_name))
+        )
+
+        select_exprs.append(winsorized.alias(col_name))
+
+    else:
+        select_exprs.append(F.col(col_name))
+
+df_winsor = df_winsor.select(*select_exprs)
+
+print("Winsorización aplicada.")
+print(f"Filas: {df_winsor.count():,}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Duplicados Isoprone
-#  Duplicados
-print("\n12. DUPLICADOS EXACTOS")
-print("-" * 100)
-
-distinct_rows = df.distinct().count()
-duplicated_rows = num_rows - distinct_rows
-
-print(f"Filas totales: {num_rows:,}")
-print(f"Filas distintas: {distinct_rows:,}")
-print(f"Filas duplicadas exactas: {duplicated_rows:,}")
+df=df_winsor
 
 # COMMAND ----------
 
@@ -381,30 +598,12 @@ print(f"Filas duplicadas exactas: {duplicated_rows:,}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Nota imputación Isoprone
-# MAGIC %md
-# MAGIC Rellenamos los nulos con la mediana aproximada para poder calcular la matriz de correlación.
-
-# COMMAND ----------
-
-# DBTITLE 1,Imputación mediana Isoprone
-# Rellenamos nulos numéricos con la mediana aproximada
-df_cleaned = df
-
-median_values = {}
-
-for c in numeric_cols:
-    try:
-        median = df_cleaned.approxQuantile(c, [0.5], 0.01)[0]
-        median_values[c] = median
-    except Exception:
-        median_values[c] = 0
-
-df_cleaned = df_cleaned.fillna(median_values)
-
-# COMMAND ----------
-
 # DBTITLE 1,Matriz correlación Isoprone
+numeric_cols = [
+    field.name for field in df.schema.fields
+    if isinstance(field.dataType, NumericType)
+]
+
 # Vectorizamos columnas numéricas
 assembler = VectorAssembler(
     inputCols=numeric_cols,
@@ -412,7 +611,7 @@ assembler = VectorAssembler(
     handleInvalid="keep"
 )
 
-df_vector_corr = assembler.transform(df_cleaned.select(*numeric_cols))
+df_vector_corr = assembler.transform(df.select(*numeric_cols))
 
 # Calculamos matriz de correlación
 corr_matrix = Correlation.corr(
@@ -460,23 +659,153 @@ else:
 
 # COMMAND ----------
 
-# DBTITLE 1,Nota decisiones correlación Isoprone
-# MAGIC %md
-# MAGIC Decidir qué columnas eliminar según criterio de dominio tras analizar los pares altamente correlacionados.
+# VARIABLES ELIMINADAS POR ALTA CORRELACIÓN
+
+cols_to_drop_corr_pairs = [
+    "torque_asym_pct"
+]
+
+df_reduced = df.drop(*cols_to_drop_corr_pairs)
+
+print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
+print(f"Columnas restantes: {len(df_reduced.columns)}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Drop columnas correlacionadas Isoprone
-# Eliminar columnas altamente correlacionadas (completar tras análisis)
+# MAGIC %md
+# MAGIC Eliminamos también las columnas que solo tienen 0s
+
+# COMMAND ----------
+
 cols_to_drop_corr_pairs = [
-    # Añadir aquí las columnas a eliminar tras revisar high_corr_pd
+    "mdc_left_max_force_n",
+    "mdc_left_avg_force_n",
+    "mdc_left_impulse_ns",
+    "mdc_left_torque_nm",
+    "mdc_right_max_force_n",
+    "mdc_right_avg_force_n",
+    "mdc_right_impulse_ns",
+    "mdc_right_torque_nm"
 ]
 
-if cols_to_drop_corr_pairs:
-    df_reduced = df_cleaned.drop(*cols_to_drop_corr_pairs)
-    print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
-    print(f"Columnas restantes: {len(df_reduced.columns)}")
-else:
-    df_reduced = df_cleaned
-    print("No se eliminaron columnas por correlación.")
-    print(f"Columnas: {len(df_reduced.columns)}")
+df_reduced = df_reduced.drop(*cols_to_drop_corr_pairs)
+
+print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
+print(f"Columnas restantes: {len(df_reduced.columns)}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Agregado por jugador.
+
+# COMMAND ----------
+
+df_base = df_reduced
+
+# Elegimos directamente las dos últimas temporadas
+temporadas_usar = ["24-25", "25-26"]
+
+df_base_ultimas_2 = (
+    df_base
+    .filter(F.col("season").isin(temporadas_usar))
+)
+
+# Comprobación de volumen por temporada
+display(
+    df_base_ultimas_2
+    .groupBy("season")
+    .agg(
+        F.count("*").alias("n_tests"),
+        F.countDistinct(ID_COL).alias("n_jugadores")
+    )
+    .orderBy("season")
+)
+
+# Columnas a excluir de la agregación física
+exclude_cols = [
+    ID_COL,
+    "test_id",
+    "test_date",
+    "test_hour_utc",
+    "device",
+    "season",
+    "is_restricted"
+]
+
+# Variables numéricas candidatas
+numeric_cols = [
+    field.name
+    for field in df_base_ultimas_2.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name not in exclude_cols
+]
+
+# Flags de missing
+missing_flag_cols = [
+    c for c in numeric_cols
+    if c.endswith("_missing")
+]
+
+# Variables físicas reales
+physical_cols = [
+    c for c in numeric_cols
+    if c not in missing_flag_cols
+]
+
+# Agregaciones de control
+agg_exprs = [
+    F.count("*").alias("n_tests_isoprone"),
+    F.countDistinct("season").alias("n_seasons_isoprone"),
+    F.min("test_date").alias("first_isoprone_test_date"),
+    F.max("test_date").alias("last_isoprone_test_date")
+]
+
+# Media y P90 de cada variable física
+for c in physical_cols:
+    agg_exprs.extend([
+        F.avg(c).alias(f"{c}_mean"),
+        F.expr(f"percentile_approx(`{c}`, 0.90)").alias(f"{c}_p90")
+    ])
+
+# Porcentaje de imputación para flags
+for c in missing_flag_cols:
+    agg_exprs.append(
+        F.avg(c).alias(f"pct_{c}")
+    )
+
+df_isoprone_player = (
+    df_base_ultimas_2
+    .groupBy(ID_COL)
+    .agg(*agg_exprs)
+)
+
+display(df_isoprone_player)
+
+# COMMAND ----------
+
+display(
+    df_isoprone_player
+    .groupBy("n_tests_isoprone")
+    .agg(F.count("*").alias("n_jugadores"))
+    .orderBy("n_tests_isoprone")
+)
+
+# COMMAND ----------
+
+null_check = df_isoprone_player.select([
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df_isoprone_player.columns
+])
+
+display(null_check)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC DROP TABLE IF EXISTS dev_gold.pitchvision.isoprone_agregado_por_jugador;
+
+# COMMAND ----------
+
+df_isoprone_player.write.mode("overwrite").saveAsTable(
+    "dev_gold.pitchvision.isoprone_agregado_por_jugador"
+)

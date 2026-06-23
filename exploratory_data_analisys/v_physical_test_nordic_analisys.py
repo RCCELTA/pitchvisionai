@@ -1,4 +1,29 @@
 # Databricks notebook source
+import sys
+import matplotlib.pyplot as plt
+from pyspark.sql import functions as F
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+import matplotlib.pyplot as plt
+from pyspark.ml.stat import Correlation
+import pandas as pd
+from pyspark.sql.window import Window
+import seaborn as sns
+from functools import reduce
+from pyspark.ml.evaluation import ClusteringEvaluator
+
+# COMMAND ----------
+
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import StandardScaler
+from pyspark.ml.feature import PCA
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.evaluation import ClusteringEvaluator
+
+# COMMAND ----------
+
 # DBTITLE 1,Header Nordic
 # MAGIC %md
 # MAGIC # Tabla v_physical_test_nordic
@@ -6,7 +31,9 @@
 # COMMAND ----------
 
 # DBTITLE 1,Carga tabla y EDA básico Nordic
+from pyspark.sql.types import NumericType, StringType, DateType, TimestampType
 TABLE_NAME = "dev_silver.pitchvision.v_physical_test_nordic"  
+
 
 df = spark.table(TABLE_NAME)
 
@@ -376,36 +403,173 @@ print(f"Filas duplicadas exactas: {duplicated_rows:,}")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Imputación de nulos
+
+# COMMAND ----------
+
+df_base = df
+
+ID_COL = "id_unico_deportista"
+
+cols_con_nulos = [
+    "left_max_force_normalized_length_bw",
+    "right_max_force_normalized_length_bw",
+    "left_max_force_normalized_bw",
+    "right_max_force_normalized_bw",
+    "torque_asym_pct",
+    "impulse_asym_pct",
+    "max_force_asym_pct",
+    "avg_force_asym_pct"
+]
+
+resumen_variables = None
+
+for col_name in cols_con_nulos:
+    
+    resumen_jugador = (
+        df_base
+        .groupBy(ID_COL)
+        .agg(
+            F.count("*").alias("n_tests"),
+            F.sum(F.col(col_name).isNotNull().cast("int")).alias("n_medidas"),
+            F.sum(F.col(col_name).isNull().cast("int")).alias("n_nulos")
+        )
+        .withColumn(
+            "estado",
+            F.when(F.col("n_medidas") == 0, "todas_nulas")
+             .when(F.col("n_nulos") == 0, "todas_medidas")
+             .otherwise("mixto")
+        )
+    )
+    
+    resumen_estado = (
+        resumen_jugador
+        .groupBy("estado")
+        .agg(
+            F.count("*").alias("n_jugadores"),
+            F.round(F.avg("n_tests"), 2).alias("avg_tests"),
+            F.round(F.avg("n_medidas"), 2).alias("avg_medidas"),
+            F.min("n_medidas").alias("min_medidas"),
+            F.max("n_medidas").alias("max_medidas")
+        )
+        .withColumn("variable", F.lit(col_name))
+        .select(
+            "variable",
+            "estado",
+            "n_jugadores",
+            "avg_tests",
+            "avg_medidas",
+            "min_medidas",
+            "max_medidas"
+        )
+    )
+    
+    resumen_variables = (
+        resumen_estado
+        if resumen_variables is None
+        else resumen_variables.unionByName(resumen_estado)
+    )
+
+display(
+    resumen_variables
+    .orderBy("variable", "estado")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Eliminar las variables normalizadas(bw) por peso y longitud/peso porque hay muchos jugadores sin ninguna medición, y conservar las variables de asimetría imputando sus pocos nulos con la mediana del propio jugador y fallback global.
+
+# COMMAND ----------
+
+# Dataframe base
+df_proc = df_base
+
+# 1. Eliminar variables con muchos nulos sistemáticos
+cols_drop = [
+    "left_max_force_normalized_length_bw",
+    "right_max_force_normalized_length_bw",
+    "left_max_force_normalized_bw",
+    "right_max_force_normalized_bw"
+]
+
+df_proc = df_proc.drop(*cols_drop)
+
+# 2. Variables de asimetría a imputar
+cols_imputar = [
+    "torque_asym_pct",
+    "max_force_asym_pct",
+    "avg_force_asym_pct",
+    "impulse_asym_pct"
+]
+
+ID_COL = "id_unico_deportista"
+
+# 3. Crear flags de missing original
+for c in cols_imputar:
+    df_proc = df_proc.withColumn(
+        f"{c}_missing",
+        F.col(c).isNull().cast("int")
+    )
+
+# 4. Imputar con mediana del propio jugador y fallback a mediana global
+for c in cols_imputar:
+    
+    mediana_global = df_proc.approxQuantile(c, [0.5], 0.01)[0]
+    
+    mediana_jugador = (
+        df_proc
+        .groupBy(ID_COL)
+        .agg(
+            F.expr(f"percentile_approx({c}, 0.5)").alias(f"{c}_median_player")
+        )
+    )
+    
+    df_proc = df_proc.join(
+        mediana_jugador,
+        on=ID_COL,
+        how="left"
+    )
+    
+    df_proc = df_proc.withColumn(
+        c,
+        F.when(
+            F.col(c).isNull() & F.col(f"{c}_median_player").isNotNull(),
+            F.col(f"{c}_median_player")
+        )
+        .when(
+            F.col(c).isNull(),
+            F.lit(mediana_global)
+        )
+        .otherwise(F.col(c))
+    )
+    
+    df_proc = df_proc.drop(f"{c}_median_player")
+
+# 5. Comprobar nulos restantes
+display(
+    df_proc.select([
+        F.sum(F.col(c).isNull().cast("int")).alias(c)
+        for c in cols_imputar
+    ])
+)
+
+# COMMAND ----------
+
 # DBTITLE 1,Header correlación Nordic
 # MAGIC %md
 # MAGIC ### Estudio de correlación de variables
 
 # COMMAND ----------
 
-# DBTITLE 1,Nota imputación Nordic
-# MAGIC %md
-# MAGIC Rellenamos los nulos con la mediana aproximada para poder calcular la matriz de correlación.
-
-# COMMAND ----------
-
-# DBTITLE 1,Imputación mediana Nordic
-# Rellenamos nulos numéricos con la mediana aproximada
-df_cleaned = df
-
-median_values = {}
-
-for c in numeric_cols:
-    try:
-        median = df_cleaned.approxQuantile(c, [0.5], 0.01)[0]
-        median_values[c] = median
-    except Exception:
-        median_values[c] = 0
-
-df_cleaned = df_cleaned.fillna(median_values)
-
-# COMMAND ----------
-
 # DBTITLE 1,Matriz correlación Nordic
+# Recompute numeric_cols from current df_proc (BW columns were dropped in cell 18)
+numeric_cols = [
+    field.name for field in df_proc.schema.fields
+    if isinstance(field.dataType, NumericType)
+]
+
 # Vectorizamos columnas numéricas
 assembler = VectorAssembler(
     inputCols=numeric_cols,
@@ -413,7 +577,7 @@ assembler = VectorAssembler(
     handleInvalid="keep"
 )
 
-df_vector_corr = assembler.transform(df_cleaned.select(*numeric_cols))
+df_vector_corr = assembler.transform(df_proc.select(*numeric_cols))
 
 # Calculamos matriz de correlación
 corr_matrix = Correlation.corr(
@@ -461,6 +625,18 @@ else:
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC left_max_force_normalized_length_bw",
+# MAGIC     "right_max_force_normalized_length_bw",
+# MAGIC     "left_max_force_normalized_bw",
+# MAGIC     "right_max_force_normalized_bw",
+# MAGIC     "torque_asym_pct",
+# MAGIC     "impulse_asym_pct",
+# MAGIC     "max_force_asym_pct",
+# MAGIC     "avg_force_asym_pct"
+
+# COMMAND ----------
+
 # DBTITLE 1,Nota decisiones correlación Nordic
 # MAGIC %md
 # MAGIC Decidir qué columnas eliminar según criterio de dominio tras analizar los pares altamente correlacionados.
@@ -470,14 +646,294 @@ else:
 # DBTITLE 1,Drop columnas correlacionadas Nordic
 # Eliminar columnas altamente correlacionadas (completar tras análisis)
 cols_to_drop_corr_pairs = [
-    # Añadir aquí las columnas a eliminar tras revisar high_corr_pd
+   "left_repetitions",
+   "torque_asym_pct",
+   "max_force_asym_pct"
 ]
 
 if cols_to_drop_corr_pairs:
-    df_reduced = df_cleaned.drop(*cols_to_drop_corr_pairs)
+    df_reduced = df_proc.drop(*cols_to_drop_corr_pairs)
     print(f"Columnas eliminadas: {cols_to_drop_corr_pairs}")
     print(f"Columnas restantes: {len(df_reduced.columns)}")
 else:
-    df_reduced = df_cleaned
+    df_reduced = df_proc
     print("No se eliminaron columnas por correlación.")
     print(f"Columnas: {len(df_reduced.columns)}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Agregar por jugador
+
+# COMMAND ----------
+
+ID_COL = "id_unico_deportista"
+SEASON_COL = "season"   # cambia si tu columna se llama distinto
+SEASON_TARGET = "25-26"
+
+# Dataframe base limpio antes de agregar
+# df_base = tu_dataframe
+
+# 1. Universo de jugadores del dataset completo
+jugadores_total = (
+    df_reduced
+    .select(ID_COL)
+    .distinct()
+)
+
+# 2. Número de tests por jugador en 25-26
+tests_2526_por_jugador = (
+    df_base
+    .filter(F.col(SEASON_COL) == SEASON_TARGET)
+    .groupBy(ID_COL)
+    .agg(
+        F.count("*").alias("n_tests_25_26")
+    )
+)
+
+# 3. Añadir jugadores con 0 tests en 25-26
+tests_2526_por_jugador_completo = (
+    jugadores_total
+    .join(tests_2526_por_jugador, on=ID_COL, how="left")
+    .fillna({"n_tests_25_26": 0})
+)
+
+# 4. Distribución: cuántos jugadores tienen 0, 1, 2, 3... tests
+distribucion_tests_2526 = (
+    tests_2526_por_jugador_completo
+    .groupBy("n_tests_25_26")
+    .agg(
+        F.count("*").alias("n_jugadores")
+    )
+    .orderBy("n_tests_25_26")
+)
+
+display(distribucion_tests_2526)
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+ID_COL = "id_unico_deportista"
+SEASON_COL = "season"   # cambia si tu columna se llama distinto
+
+SEASONS_TARGET = ["24-25", "25-26"]
+
+# 1. Universo de jugadores del dataset completo
+jugadores_total = (
+    df_base
+    .select(ID_COL)
+    .distinct()
+)
+
+# 2. Número de tests por jugador en 24-25 y 25-26
+tests_ultimas_temporadas_por_jugador = (
+    df_base
+    .filter(F.col(SEASON_COL).isin(SEASONS_TARGET))
+    .groupBy(ID_COL)
+    .agg(
+        F.count("*").alias("n_tests_24_25_25_26")
+    )
+)
+
+# 3. Añadir jugadores con 0 tests en esas temporadas
+tests_ultimas_temporadas_completo = (
+    jugadores_total
+    .join(
+        tests_ultimas_temporadas_por_jugador,
+        on=ID_COL,
+        how="left"
+    )
+    .fillna({"n_tests_24_25_25_26": 0})
+)
+
+# 4. Distribución: cuántos jugadores tienen 0, 1, 2, 3... tests
+distribucion_tests_ultimas_temporadas = (
+    tests_ultimas_temporadas_completo
+    .groupBy("n_tests_24_25_25_26")
+    .agg(
+        F.count("*").alias("n_jugadores")
+    )
+    .orderBy("n_tests_24_25_25_26")
+)
+
+display(distribucion_tests_ultimas_temporadas)
+
+# COMMAND ----------
+
+ID_COL = "id_unico_deportista"
+SEASON_COL = "season"
+
+df_base = df_proc
+
+MIN_TESTS_25_26 = 5
+SEASON_RECENT = "25-26"
+SEASONS_RECENT_2 = ["24-25", "25-26"]
+
+jugadores_total = (
+    df_base
+    .select(ID_COL)
+    .distinct()
+)
+
+tests_25_26 = (
+    df_base
+    .filter(F.col(SEASON_COL) == SEASON_RECENT)
+    .groupBy(ID_COL)
+    .agg(F.count("*").alias("n_tests_25_26"))
+)
+
+tests_24_25_25_26 = (
+    df_base
+    .filter(F.col(SEASON_COL).isin(SEASONS_RECENT_2))
+    .groupBy(ID_COL)
+    .agg(F.count("*").alias("n_tests_24_25_25_26"))
+)
+
+criterio_jugador = (
+    jugadores_total
+    .join(tests_25_26, on=ID_COL, how="left")
+    .join(tests_24_25_25_26, on=ID_COL, how="left")
+    .fillna({
+        "n_tests_25_26": 0,
+        "n_tests_24_25_25_26": 0
+    })
+    .withColumn(
+        "temporada_fuente",
+        F.when(
+            F.col("n_tests_25_26") >= MIN_TESTS_25_26,
+            F.lit("solo_25_26")
+        )
+        .when(
+            F.col("n_tests_24_25_25_26") > 0,
+            F.lit("24_25_y_25_26")
+        )
+        .otherwise(F.lit("todas_disponibles"))
+    )
+)
+
+display(
+    criterio_jugador
+    .groupBy("temporada_fuente")
+    .agg(
+        F.count("*").alias("n_jugadores"),
+        F.avg("n_tests_25_26").alias("avg_tests_25_26"),
+        F.avg("n_tests_24_25_25_26").alias("avg_tests_24_25_25_26")
+    )
+)
+
+# COMMAND ----------
+
+df_con_criterio = (
+    df_base
+    .join(
+        criterio_jugador.select(ID_COL, "temporada_fuente"),
+        on=ID_COL,
+        how="inner"
+    )
+)
+
+df_tests_para_agregar = (
+    df_con_criterio
+    .filter(
+        (
+            (F.col("temporada_fuente") == "solo_25_26") &
+            (F.col(SEASON_COL) == "25-26")
+        )
+        |
+        (
+            (F.col("temporada_fuente") == "24_25_y_25_26") &
+            (F.col(SEASON_COL).isin(["24-25", "25-26"]))
+        )
+        |
+        (
+            F.col("temporada_fuente") == "todas_disponibles"
+        )
+    )
+)
+
+display(
+    df_tests_para_agregar
+    .groupBy("temporada_fuente")
+    .agg(
+        F.count("*").alias("n_tests"),
+        F.countDistinct(ID_COL).alias("n_jugadores")
+    )
+)
+
+# COMMAND ----------
+
+cols_excluir_agregacion = [
+    ID_COL,
+    "test_id",
+    "test_date",
+    "test_hour_utc",
+    "device",
+    SEASON_COL,
+    "temporada_fuente"
+]
+
+numeric_cols = [
+    field.name
+    for field in df_tests_para_agregar.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name not in cols_excluir_agregacion
+    and not field.name.endswith("_missing")
+]
+
+missing_flag_cols = [
+    field.name
+    for field in df_tests_para_agregar.schema.fields
+    if isinstance(field.dataType, NumericType)
+    and field.name.endswith("_missing")
+]
+
+agg_exprs = [
+    F.count("*").alias("n_tests_agregados"),
+    F.countDistinct(SEASON_COL).alias("n_temporadas_agregadas"),
+    F.first("temporada_fuente").alias("temporada_fuente"),
+    F.min("test_date").alias("first_test_date"),
+    F.max("test_date").alias("last_test_date")
+]
+
+# Media de variables numéricas
+for c in numeric_cols:
+    agg_exprs.append(
+        F.avg(c).alias(f"{c}_mean")
+    )
+
+# Flags de missing como porcentaje
+for c in missing_flag_cols:
+    agg_exprs.append(
+        F.avg(c).alias(f"pct_{c}")
+    )
+
+df_player_agg = (
+    df_tests_para_agregar
+    .groupBy(ID_COL)
+    .agg(*agg_exprs)
+)
+
+display(df_player_agg)
+
+# COMMAND ----------
+
+display(
+    df_player_agg
+    .groupBy("temporada_fuente")
+    .agg(
+        F.count("*").alias("n_jugadores"),
+        F.avg("n_tests_agregados").alias("avg_tests_agregados"),
+        F.min("n_tests_agregados").alias("min_tests"),
+        F.max("n_tests_agregados").alias("max_tests")
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC La estrategia de agregación prioriza siempre la información más reciente del jugador, pero evitando construir perfiles poco fiables con muy pocos tests. Para cada deportista, si dispone de al menos 5 mediciones en la temporada 25-26, se agregan únicamente esos registros, ya que representan mejor su estado actual. Si no alcanza ese mínimo, se amplía la ventana temporal incluyendo también la temporada 24-25, aumentando así la estabilidad del perfil. Finalmente, para los jugadores sin mediciones en las dos últimas temporadas, se utilizan todos los registros históricos disponibles para no perderlos del análisis. Una vez seleccionados los tests válidos para cada jugador, las variables numéricas se agregan mediante la media, generando una única fila por deportista que resume su perfil físico para el clustering.
+
+# COMMAND ----------
+
+df_player_agg.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.nordic_agregado_por_jugador")
