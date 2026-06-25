@@ -1,34 +1,4 @@
 # Databricks notebook source
-# ============================================================
-# KEEP ALIVE LIGERO PARA DATABRICKS
-# Mantiene el cluster activo durante un tiempo limitado
-# ============================================================
-
-import time
-from datetime import datetime
-
-# Configuración
-DURATION_MINUTES = 60   # tiempo total que quieres mantenerlo activo
-PING_EVERY_MINUTES = 2  # cada cuántos minutos hace una operación mínima
-
-num_pings = DURATION_MINUTES // PING_EVERY_MINUTES
-
-print(f"Iniciando keep alive durante {DURATION_MINUTES} minutos...")
-print(f"Ping cada {PING_EVERY_MINUTES} minutos.")
-
-for i in range(int(num_pings)):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] Ping {i + 1}/{int(num_pings)}")
-
-    # Operación Spark mínima
-    spark.range(1).count()
-
-    time.sleep(PING_EVERY_MINUTES * 60)
-
-print("Keep alive terminado.")
-
-# COMMAND ----------
-
 dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -493,6 +463,42 @@ display(df_imputed.limit(20))
 
 # COMMAND ----------
 
+#  Nulos por columna
+
+print("\n5. NULOS POR COLUMNA")
+null_exprs = [
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df_imputed.columns
+]
+
+nulls_df_imputed = df_imputed.agg(*null_exprs)
+
+nulls_long = nulls_df_imputed.select(
+    F.explode(
+        F.array(*[
+            F.struct(
+                F.lit(c).alias("columna"),
+                F.col(c).alias("nulos")
+            )
+            for c in df_imputed.columns
+        ])
+    ).alias("x")
+).select("x.*")
+
+nulls_report = (
+    nulls_long
+    .withColumn("filas_totales", F.lit(num_rows))
+    .withColumn(
+        "porcentaje_nulos",
+        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
+    )
+    .orderBy(F.col("porcentaje_nulos").desc())
+)
+
+display(nulls_report)
+
+# COMMAND ----------
+
 df_check = df_imputed
 
 total_rows = df_check.count()
@@ -528,42 +534,6 @@ null_report_after = (
 display(
     null_report_after.filter(F.col("nulos_restantes") > 0)
 )
-
-# COMMAND ----------
-
-#  Nulos por columna
-
-print("\n5. NULOS POR COLUMNA")
-null_exprs = [
-    F.sum(F.col(c).isNull().cast("int")).alias(c)
-    for c in df_imputed.columns
-]
-
-nulls_df_imputed = df_imputed.agg(*null_exprs)
-
-nulls_long = nulls_df_imputed.select(
-    F.explode(
-        F.array(*[
-            F.struct(
-                F.lit(c).alias("columna"),
-                F.col(c).alias("nulos")
-            )
-            for c in df_imputed.columns
-        ])
-    ).alias("x")
-).select("x.*")
-
-nulls_report = (
-    nulls_long
-    .withColumn("filas_totales", F.lit(num_rows))
-    .withColumn(
-        "porcentaje_nulos",
-        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
-    )
-    .orderBy(F.col("porcentaje_nulos").desc())
-)
-
-display(nulls_report)
 
 # COMMAND ----------
 

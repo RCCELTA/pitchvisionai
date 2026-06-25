@@ -22,8 +22,15 @@ import matplotlib.patches as mpatches
 
 # COMMAND ----------
 
+spark.sql("""
+    ALTER TABLE dev_gold.pitchvision.injury_risk_input_filtered
+    RENAME TO dev_gold.pitchvision.injury_risk_input
+""")
 
-TABLE_NAME = "dev_gold.pitchvision.injury_risk_input_filtered"
+# COMMAND ----------
+
+
+TABLE_NAME = "dev_gold.pitchvision.injury_risk_input"
 
 df = spark.table(TABLE_NAME)
 
@@ -259,6 +266,10 @@ display(df_limpio_2.limit(10))
 
 # COMMAND ----------
 
+df_limpio_2.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.injury_risk_input_filtered")
+
+# COMMAND ----------
+
 print("Calculando pesos de balanceo para la variable objetivo...")
 
 # Contamos totales de la base de datos actual
@@ -385,6 +396,10 @@ df_historico_riesgo = df_predicciones_con_riesgo.select(           # Limpiamos e
 )
 
 display(df_historico_riesgo.limit(5))
+
+# COMMAND ----------
+
+df_historico_riesgo.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.resultados_semaforo_LR")
 
 # COMMAND ----------
 
@@ -591,6 +606,10 @@ df_historico_riesgo_rf = df_predicciones_rf.select(
 )
 
 display(df_historico_riesgo_rf.limit(5))
+
+# COMMAND ----------
+
+df_historico_riesgo.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.resultados_semaforo_RF")
 
 # COMMAND ----------
 
