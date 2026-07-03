@@ -1,34 +1,4 @@
 # Databricks notebook source
-# ============================================================
-# KEEP ALIVE LIGERO PARA DATABRICKS
-# Mantiene el cluster activo durante un tiempo limitado
-# ============================================================
-
-import time
-from datetime import datetime
-
-# Configuración
-DURATION_MINUTES = 60   # tiempo total que quieres mantenerlo activo
-PING_EVERY_MINUTES = 2  # cada cuántos minutos hace una operación mínima
-
-num_pings = DURATION_MINUTES // PING_EVERY_MINUTES
-
-print(f"Iniciando keep alive durante {DURATION_MINUTES} minutos...")
-print(f"Ping cada {PING_EVERY_MINUTES} minutos.")
-
-for i in range(int(num_pings)):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] Ping {i + 1}/{int(num_pings)}")
-
-    # Operación Spark mínima
-    spark.range(1).count()
-
-    time.sleep(PING_EVERY_MINUTES * 60)
-
-print("Keep alive terminado.")
-
-# COMMAND ----------
-
 import sys
 import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
