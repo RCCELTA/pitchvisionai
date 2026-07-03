@@ -3,6 +3,11 @@
 # [tool.databricks.environment]
 # environment_version = "5"
 # ///
+# DBTITLE 1,Instalación de dependencias
+# MAGIC %pip install shap --quiet
+
+# COMMAND ----------
+
 import sys
 import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
@@ -19,13 +24,6 @@ from pyspark.sql.functions import col, udf
 from pyspark.ml.classification import LogisticRegression
 import numpy as np
 import matplotlib.patches as mpatches
-
-# COMMAND ----------
-
-spark.sql("""
-    ALTER TABLE dev_gold.pitchvision.injury_risk_input_filtered
-    RENAME TO dev_gold.pitchvision.injury_risk_input
-""")
 
 # COMMAND ----------
 
@@ -266,7 +264,31 @@ display(df_limpio_2.limit(10))
 
 # COMMAND ----------
 
-df_limpio_2.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.injury_risk_input_filtered")
+# DBTITLE 1,Cell 19
+df_limpio_2.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev_gold.pitchvision.injury_risk_input_filtered")
+
+# COMMAND ----------
+
+from pyspark.sql.functions import sum as spark_sum
+
+# Agrupar por fecha y contar jugadores con injury_risk == 1
+df_histograma = df_limpio_2.groupBy("activity_date").agg(
+    spark_sum("injury_risk").alias("jugadores_lesionados")
+).orderBy("activity_date")
+
+# Convertir a Pandas para graficar
+pdf_histograma = df_histograma.toPandas()
+pdf_histograma['activity_date'] = pd.to_datetime(pdf_histograma['activity_date'])
+
+plt.figure(figsize=(14, 6))
+plt.bar(pdf_histograma['activity_date'], pdf_histograma['jugadores_lesionados'], color='#d9534f', width=0.8)
+plt.xlabel("Fecha", fontsize=13)
+plt.ylabel("Jugadores con riesgo de lesión", fontsize=13)
+plt.title("Histograma de Jugadores con Riesgo de Lesión por Fecha", fontsize=15)
+plt.xticks(rotation=45)
+plt.grid(axis='y', color='#f0f0f0', linestyle='--')
+plt.tight_layout()
+plt.show()
 
 # COMMAND ----------
 
@@ -609,7 +631,8 @@ display(df_historico_riesgo_rf.limit(5))
 
 # COMMAND ----------
 
-df_historico_riesgo.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.resultados_semaforo_RF")
+# DBTITLE 1,Cell 41
+df_historico_riesgo_rf.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.resultados_semaforo_RF")
 
 # COMMAND ----------
 
@@ -700,3 +723,112 @@ plt.ylabel("Variables evaluadas", fontsize=12)
 plt.grid(True, axis='x', color='#f0f0f0', linestyle='--')
 plt.tight_layout()
 plt.show()
+
+# COMMAND ----------
+
+# DBTITLE 1,SHAP — Introducción
+# MAGIC %md
+# MAGIC # Análisis SHAP — Interpretabilidad por Predicción
+# MAGIC SHAP (SHapley Additive exPlanations) descompone cada predicción individual mostrando cuánto contribuye cada feature al riesgo calculado. A diferencia de la importancia global (coeficientes / impureza de Gini), SHAP muestra **dirección + magnitud** por cada observación concreta.
+# MAGIC
+# MAGIC - **Beeswarm**: visión global de todas las predicciones.
+# MAGIC - **Waterfall**: por qué exactamente el jugador de mayor riesgo recibe esa predicción.
+
+# COMMAND ----------
+
+# DBTITLE 1,SHAP — Extracción de features
+import shap
+import numpy as np
+SAMPLE_SIZE = 30000
+
+pdf_shap = (
+    df_entrenamiento
+    .orderBy(F.rand(seed=42))
+    .limit(SAMPLE_SIZE)
+    .toPandas()
+)
+
+X_shap    = np.array([v.toArray() for v in pdf_shap["features"]])
+y_shap    = pdf_shap[columna_objetivo].values
+meta_shap = pdf_shap[["id_unico_deportista", "activity_date"]].reset_index(drop=True)
+
+print(f"Muestra SHAP : {X_shap.shape}")
+print(f"Positivos (riesgo=1): {y_shap.sum()}  |  Negativos: {(y_shap == 0).sum()}")
+
+# COMMAND ----------
+
+# DBTITLE 1,SHAP — Regresión Logística (LinearExplainer)
+coef_lr  = modelo_entrenado.coefficients.toArray()
+inter_lr = float(modelo_entrenado.intercept)
+
+explainer_lr   = shap.LinearExplainer(
+    (coef_lr, inter_lr),
+    X_shap,
+    feature_perturbation="interventional"
+)
+shap_values_lr = explainer_lr.shap_values(X_shap)
+
+shap.summary_plot(shap_values_lr, X_shap, feature_names=valid_features, max_display=20, show=False)
+plt.title("SHAP — Regresión Logística: impacto de features en el riesgo", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+probs_lr = 1.0 / (1.0 + np.exp(-(X_shap @ coef_lr + inter_lr)))
+idx_max  = int(np.argmax(probs_lr))
+
+print(f"\nJugador con mayor riesgo (LR):")
+print(f"  ID          : {meta_shap.iloc[idx_max]['id_unico_deportista']}")
+print(f"  Fecha       : {meta_shap.iloc[idx_max]['activity_date']}")
+print(f"  Probabilidad: {probs_lr[idx_max]:.4f}")
+print(f"  Label real  : {y_shap[idx_max]}")
+
+shap.waterfall_plot(
+    shap.Explanation(
+        values        = shap_values_lr[idx_max],
+        base_values   = explainer_lr.expected_value,
+        data          = X_shap[idx_max],
+        feature_names = valid_features
+    ),
+    max_display=15,
+    show=False
+)
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+# DBTITLE 1,SHAP — Top-5 features por predicción (semáforo completo)
+pdf_full  = df_entrenamiento.toPandas()
+X_full    = np.array([v.toArray() for v in pdf_full["features"]])
+meta_full = pdf_full[["id_unico_deportista", "activity_date"]].reset_index(drop=True)
+
+shap_full  = explainer_lr.shap_values(X_full)                        # (n_filas, n_features)
+probs_full = 1.0 / (1.0 + np.exp(-(X_full @ coef_lr + inter_lr)))   # probabilidad de riesgo
+
+fn_arr   = np.array(valid_features)
+topN = 10
+topN_idx = np.argsort(-np.abs(shap_full), axis=1)[:, :topN]         # índices con mayor |SHAP|
+
+result = {
+    "id_unico_deportista": meta_full["id_unico_deportista"].values,
+    "activity_date":       meta_full["activity_date"].values,
+    "probabilidad_riesgo": np.round(probs_full, 6),
+}
+for rank in range(1, topN + 1):
+    col_idx = topN_idx[:, rank - 1]
+    result[f"feature_{rank}"] = fn_arr[col_idx]
+    result[f"shap_{rank}"]    = shap_full[np.arange(len(shap_full)), col_idx].round(6)
+
+df_topN_lr = pd.DataFrame(result)
+
+# 4. Vista previa ordenada por mayor riesgo
+display(df_topN_lr.sort_values("probabilidad_riesgo", ascending=False).head(20))
+
+# 5. Guardar como tabla Delta
+(
+    spark.createDataFrame(df_topN_lr)
+    .write.mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable("dev_gold.pitchvision.semaforo_shap_top10_LR")
+)
+print(f"Tabla guardada → dev_gold.pitchvision.semaforo_shap_top10_LR  ({len(df_topN_lr):,} filas)")

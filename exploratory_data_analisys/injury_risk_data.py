@@ -187,12 +187,12 @@ df_final = (
         injury_dates,
         on=[
             df_filtered["id_unico_deportista"] == injury_dates["inj_player"],
-            injury_dates["injury_date"]         >  df_filtered["activity_date"],
+            injury_dates["injury_date"]         >= df_filtered["activity_date"],
             injury_dates["injury_date"]         <= F.date_add(df_filtered["activity_date"], 7),
         ],
         how="left"
     )
-    .drop("inj_player", "injury_date")
+    .drop("inj_player")
     .withColumn(
         "injury_risk",
         F.when(F.col("injury_id").isNotNull(), 1).otherwise(0)
@@ -205,13 +205,95 @@ total     = df_final.count()
 positivos = df_final.filter(F.col("injury_risk") == 1).count()
 negativos = total - positivos
 
-print(f"Filas totales  : {total:,}")
-print(f"injury_risk = 1: {positivos:,}  ({round(positivos/total*100, 1)}%)")
-print(f"injury_risk = 0: {negativos:,}  ({round(negativos/total*100, 1)}%)")
+# print(f"Filas totales  : {total:,}")
+# print(f"injury_risk = 1: {positivos:,}  ({round(positivos/total*100, 1)}%)")
+# print(f"injury_risk = 0: {negativos:,}  ({round(negativos/total*100, 1)}%)")
 
 # COMMAND ----------
 
-df_final.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.injury_risk_input_raw")
+display(df_final)
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
+
+# ── 1. Preparar datos ──────────────────────────────────────────────────────────
+# Si df_final es un Spark DataFrame, conviértelo primero:
+df = df_final.toPandas()
+
+df["activity_date"] = pd.to_datetime(df["activity_date"])
+df["injury_date"]   = pd.to_datetime(df["injury_date"])
+
+# ── 2. Histograma 1: actividades con lesión por fecha ─────────────────────────
+df_lesion = df[df["injury_date"].notna()]  # solo filas con lesión registrada
+
+lesiones_por_fecha = (
+    df_lesion
+    .groupby("activity_date")
+    .size()
+    .reset_index(name="n_lesiones")
+)
+
+fig, ax = plt.subplots(figsize=(14, 4))
+
+ax.bar(
+    lesiones_por_fecha["activity_date"],
+    lesiones_por_fecha["n_lesiones"],
+    width=1,
+    color="#2a78d6",
+    edgecolor="white",
+    linewidth=0.4,
+)
+
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+plt.xticks(rotation=45, ha="right")
+
+ax.set_xlabel("Fecha de actividad")
+ax.set_ylabel("Nº de lesiones")
+ax.set_title("Lesiones por fecha de actividad")
+ax.spines[["top", "right"]].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+# ── 3. Histograma 2: injury_risk (0/1) por fecha de actividad ─────────────────
+risk_por_fecha = (
+    df
+    .groupby("activity_date")["injury_risk"]
+    .sum()          # suma los 1s → total en riesgo ese día
+    .reset_index(name="n_risk")
+)
+
+fig, ax = plt.subplots(figsize=(14, 4))
+
+ax.bar(
+    risk_por_fecha["activity_date"],
+    risk_por_fecha["n_risk"],
+    width=1,
+    color="#e34948",
+    edgecolor="white",
+    linewidth=0.4,
+)
+
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+plt.xticks(rotation=45, ha="right")
+
+ax.set_xlabel("Fecha de actividad")
+ax.set_ylabel("Deportistas en riesgo (injury_risk = 1)")
+ax.set_title("Injury risk por fecha de actividad")
+ax.spines[["top", "right"]].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+# DBTITLE 1,Untitled
+df_final.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev_gold.pitchvision.injury_risk_input_raw")
 
 # COMMAND ----------
 
@@ -463,42 +545,6 @@ display(df_imputed.limit(20))
 
 # COMMAND ----------
 
-#  Nulos por columna
-
-print("\n5. NULOS POR COLUMNA")
-null_exprs = [
-    F.sum(F.col(c).isNull().cast("int")).alias(c)
-    for c in df_imputed.columns
-]
-
-nulls_df_imputed = df_imputed.agg(*null_exprs)
-
-nulls_long = nulls_df_imputed.select(
-    F.explode(
-        F.array(*[
-            F.struct(
-                F.lit(c).alias("columna"),
-                F.col(c).alias("nulos")
-            )
-            for c in df_imputed.columns
-        ])
-    ).alias("x")
-).select("x.*")
-
-nulls_report = (
-    nulls_long
-    .withColumn("filas_totales", F.lit(num_rows))
-    .withColumn(
-        "porcentaje_nulos",
-        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
-    )
-    .orderBy(F.col("porcentaje_nulos").desc())
-)
-
-display(nulls_report)
-
-# COMMAND ----------
-
 df_check = df_imputed
 
 total_rows = df_check.count()
@@ -534,6 +580,42 @@ null_report_after = (
 display(
     null_report_after.filter(F.col("nulos_restantes") > 0)
 )
+
+# COMMAND ----------
+
+#  Nulos por columna
+
+print("\n5. NULOS POR COLUMNA")
+null_exprs = [
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df_imputed.columns
+]
+
+nulls_df_imputed = df_imputed.agg(*null_exprs)
+
+nulls_long = nulls_df_imputed.select(
+    F.explode(
+        F.array(*[
+            F.struct(
+                F.lit(c).alias("columna"),
+                F.col(c).alias("nulos")
+            )
+            for c in df_imputed.columns
+        ])
+    ).alias("x")
+).select("x.*")
+
+nulls_report = (
+    nulls_long
+    .withColumn("filas_totales", F.lit(num_rows))
+    .withColumn(
+        "porcentaje_nulos",
+        F.round((F.col("nulos") / F.col("filas_totales")) * 100, 2)
+    )
+    .orderBy(F.col("porcentaje_nulos").desc())
+)
+
+display(nulls_report)
 
 # COMMAND ----------
 
@@ -862,4 +944,5 @@ display(suma_injury_risk_new)
 
 # COMMAND ----------
 
-df_no_null_cols.write.mode("overwrite").saveAsTable("dev_gold.pitchvision.injury_risk_input_filtered")
+# DBTITLE 1,Cell 50
+df_no_null_cols.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("dev_gold.pitchvision.injury_risk_input_filtered")
