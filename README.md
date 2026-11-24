@@ -4,6 +4,8 @@
 
 Este código forma parte del proyecto PitchVision AI (expediente TSI-100130-2024-074), financiado por el Ministerio para la Transformación Digital y de la Función Pública y por la Unión Europea – NextGenerationEU, en el marco del Plan de Recuperación, Transformación y Resiliencia.
 
+![Financiado por la Unión Europea – NextGenerationEU · Gobierno de España · Plan de Recuperación, Transformación y Resiliencia · RC Celta](docs/logos_financiacion.png)
+
 Sistema de análisis de datos deportivos para evaluación de rendimiento físico y predicción de riesgo de lesiones en futbolistas, utilizando técnicas de machine learning y análisis de datos con PySpark.
  
 ## Descripción del Proyecto
