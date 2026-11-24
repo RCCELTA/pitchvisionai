@@ -1,5 +1,9 @@
 # PitchVision AI
- 
+
+**Proyecto PitchVision AI – Real Club Celta de Vigo, S.A.D.**
+
+Este código forma parte del proyecto PitchVision AI (expediente TSI-100130-2024-074), financiado por el Ministerio para la Transformación Digital y de la Función Pública y por la Unión Europea – NextGenerationEU, en el marco del Plan de Recuperación, Transformación y Resiliencia.
+
 Sistema de análisis de datos deportivos para evaluación de rendimiento físico y predicción de riesgo de lesiones en futbolistas, utilizando técnicas de machine learning y análisis de datos con PySpark.
  
 ## Descripción del Proyecto
@@ -35,7 +39,6 @@ Implementación de algoritmos de clustering (K-Means con PCA) para segmentación
  
 #### `aggregated_data/`
 - **`clustering_aggregated_data.py`**: Clustering sobre datos agregados completos
-- **`clustering_aggregated_data_nacho.py`**: Versión alternativa del clustering agregado
 - **`clustering_aggregated_fisicas_anthropometry.py`**: Clustering combinando pruebas físicas y antropometría
 - **`clustering_aggregated_nordic_isoprone_gps.py`**: Clustering específico para Nordic, Isoprone y GPS
 - **`clustering_aggregated_todo.py`**: Clustering con todas las variables disponibles
